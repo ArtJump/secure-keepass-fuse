@@ -4,5 +4,5 @@
 
 password - 123456
 ```bash
-go run main.go ./test.kdbx ./mnt/secure-kdbx --debug
+go run main.go --verbose ./test.kdbx ./mnt/secure-kdbx
 ```
