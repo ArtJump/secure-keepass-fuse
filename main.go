@@ -42,6 +42,7 @@ type DirEntry struct {
 	Dirs  map[string]*DirEntry
 }
 
+// NewDirEntry creates a new directory entry structure
 func NewDirEntry(name string) *DirEntry {
 	return &DirEntry{
 		Name:  name,
@@ -101,6 +102,7 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 	// 1. Fetch XML structure
 	log.Println("[INFO] Reading database structure...")
 
+	// We technically could use -q here too, but the XML parser has logic to skip garbage anyway.
 	args := []string{"export", dbPath}
 	if keyFile != "" {
 		args = append(args, "--key-file", keyFile)
@@ -122,7 +124,7 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 		return nil, fmt.Errorf("CLI export failed: %v (Stderr: %s)", err, stderr.String())
 	}
 
-	// Clean up potential garbage output before XML tag
+	// Clean up potential garbage output (keepassxc-cli sometimes prints banners to stdout)
 	rawBytes := out.Bytes()
 	startIdx := bytes.Index(rawBytes, []byte("<KeePassFile"))
 	if startIdx == -1 {
@@ -180,7 +182,6 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 
 			for _, binRef := range entry.Binaries {
 				fName := strings.TrimSpace(binRef.Key)
-				// Sanitize filename to be safe
 				safeFName := sanitizeName(fName)
 
 				allowedBins, ok := rules[fName]
@@ -190,7 +191,7 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 
 				log.Printf("[EXTRACT] Extracting '%s' from entry '%s' -> '%s'...", fName, title, groupName)
 
-				// Pass pwd as []byte
+				// Fetch file content
 				content, err := fetchAttachment(ctx, dbPath, keyFile, pwd, title, fName)
 				if err != nil {
 					log.Printf("   [ERR] Failed to extract file: %v. Skipping...", err)
@@ -223,14 +224,14 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 
 // fetchAttachment calls CLI for a specific attachment accepts pwd as []byte
 func fetchAttachment(ctx context.Context, dbPath, keyFile string, pwd []byte, entryTitle, attachmentName string) ([]byte, error) {
-	args := []string{"attachment-export", dbPath, entryTitle, attachmentName, "/dev/stdout"}
+	args := []string{"attachment-export", "-q", dbPath, entryTitle, attachmentName, "/dev/stdout"}
 	if keyFile != "" {
 		args = append(args, "--key-file", keyFile)
 	}
 
 	cmd := exec.CommandContext(ctx, "keepassxc-cli", args...)
 
-	// SECURE FIX: Same usage of MultiReader
+	// SECURE FIX: Same usage of MultiReader to stream password
 	cmd.Stdin = io.MultiReader(bytes.NewReader(pwd), bytes.NewReader([]byte("\n")))
 
 	var out bytes.Buffer
