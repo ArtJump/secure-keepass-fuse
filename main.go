@@ -2,15 +2,11 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/xml"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -19,6 +15,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/tobischo/gokeepasslib/v3"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
@@ -51,38 +48,6 @@ func NewDirEntry(name string) *DirEntry {
 	}
 }
 
-// --- XML Parsing ---
-
-type KpxRoot struct {
-	XMLName xml.Name  `xml:"KeePassFile"`
-	Root    KpxGroups `xml:"Root"`
-}
-
-type KpxGroups struct {
-	Group KpxGroup `xml:"Group"`
-}
-
-type KpxGroup struct {
-	Name    string     `xml:"Name"`
-	Entries []KpxEntry `xml:"Entry"`
-	Groups  []KpxGroup `xml:"Group"`
-}
-
-type KpxEntry struct {
-	UUID     string           `xml:"UUID"`
-	Strings  []KpxString      `xml:"String"`
-	Binaries []KpxEntryBinary `xml:"Binary"`
-}
-
-type KpxString struct {
-	Key   string `xml:"Key"`
-	Value string `xml:"Value"`
-}
-
-type KpxEntryBinary struct {
-	Key string `xml:"Key"` // Filename
-}
-
 // --- Logic ---
 
 // wipeBytes zeroes out the byte slice
@@ -93,61 +58,56 @@ func wipeBytes(b []byte) {
 }
 
 // sanitizeName replaces file system path separators with underscores
-// to prevent path traversal issues or invalid directory structures.
 func sanitizeName(name string) string {
 	return strings.ReplaceAll(name, "/", "_")
 }
 
-func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
-	// 1. Fetch XML structure
-	log.Println("[INFO] Reading database structure...")
+// loadDB loads the KDBX file using gokeepasslib and builds the in-memory definition tree.
+func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
+	log.Println("[INFO] Opening database...")
 
-	// We technically could use -q here too, but the XML parser has logic to skip garbage anyway.
-	args := []string{"export", dbPath}
+	file, err := os.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open db file: %w", err)
+	}
+	defer file.Close()
+
+	// 1. Create Credentials based on whether a keyfile is provided
+	var creds *gokeepasslib.DBCredentials
+	pwdStr := string(pwd) // Library requires string. Note: Creates a copy in memory.
+
 	if keyFile != "" {
-		args = append(args, "--key-file", keyFile)
+		// Using NewPasswordAndKeyCredentials if keyfile exists
+		creds, err = gokeepasslib.NewPasswordAndKeyCredentials(pwdStr, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load credentials with keyfile: %w", err)
+		}
+	} else {
+		// Using NewPasswordCredentials if only password provided
+		creds = gokeepasslib.NewPasswordCredentials(pwdStr)
 	}
 
-	cmd := exec.CommandContext(ctx, "keepassxc-cli", args...)
+	db := gokeepasslib.NewDatabase()
+	db.Credentials = creds
 
-	// SECURE FIX: Using MultiReader.
-	// feeding password bytes + newline byte.
-	// Avoids creating a string copy of the password.
-	cmd.Stdin = io.MultiReader(bytes.NewReader(pwd), bytes.NewReader([]byte("\n")))
-
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("CLI export failed: %v (Stderr: %s)", err, stderr.String())
+	// 2. Decode the database
+	if err := gokeepasslib.NewDecoder(file).Decode(db); err != nil {
+		return nil, fmt.Errorf("failed to decode kdbx: %w", err)
 	}
 
-	// Clean up potential garbage output (keepassxc-cli sometimes prints banners to stdout)
-	rawBytes := out.Bytes()
-	startIdx := bytes.Index(rawBytes, []byte("<KeePassFile"))
-	if startIdx == -1 {
-		startIdx = bytes.Index(rawBytes, []byte("<?xml"))
-	}
-	if startIdx == -1 {
-		return nil, fmt.Errorf("failed to find valid XML in CLI output")
+	// 3. Unlock protected entries (Password, protected notes, etc.)
+	if err := db.UnlockProtectedEntries(); err != nil {
+		return nil, fmt.Errorf("failed to unlock entries: %w", err)
 	}
 
-	var db KpxRoot
-	if err := xml.Unmarshal(rawBytes[startIdx:], &db); err != nil {
-		return nil, fmt.Errorf("XML parsing error: %v", err)
-	}
-	out.Reset()
+	log.Println("[INFO] Database decrypted. Building file tree...")
 
 	// Root of our file system tree
 	rootEntry := NewDirEntry("root")
 
-	// 2. Traversal and targeted file extraction
-	var processGroup func(g KpxGroup, parentDir *DirEntry)
-	processGroup = func(g KpxGroup, parentDir *DirEntry) {
-
-		// Determine directory name for the current group
+	// Recursive processing
+	var processGroup func(g gokeepasslib.Group, parentDir *DirEntry)
+	processGroup = func(g gokeepasslib.Group, parentDir *DirEntry) {
 		groupName := sanitizeName(g.Name)
 		if groupName == "" {
 			groupName = "_unnamed_group_"
@@ -160,17 +120,12 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 			parentDir.Dirs[groupName] = currentDir
 		}
 
+		// Process Entries in this group
 		for _, entry := range g.Entries {
-			var title, notes string
-			for _, s := range entry.Strings {
-				if s.Key == "Title" {
-					title = s.Value
-				}
-				if s.Key == "Notes" {
-					notes = s.Value
-				}
-			}
+			title := entry.GetTitle()
+			notes := entry.GetContent("Notes")
 
+			// KDBX entry only stores references to binaries. Check if any exist.
 			if len(entry.Binaries) == 0 || notes == "" || title == "" {
 				continue
 			}
@@ -180,8 +135,9 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 				continue
 			}
 
+			// Iterate over Binary References in the Entry
 			for _, binRef := range entry.Binaries {
-				fName := strings.TrimSpace(binRef.Key)
+				fName := strings.TrimSpace(binRef.Name)
 				safeFName := sanitizeName(fName)
 
 				allowedBins, ok := rules[fName]
@@ -189,25 +145,31 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 					continue
 				}
 
-				log.Printf("[EXTRACT] Extracting '%s' from entry '%s' -> '%s'...", fName, title, groupName)
+				// Find the actual binary content using the ID from the reference
+				// db.FindBinary looks up in the InnerHeader (KDBX4) or Meta (KDBX3)
+				binaryData := db.FindBinary(binRef.Value.ID)
+				if binaryData == nil {
+					log.Printf("   [WARN] Binary '%s' referenced in entry '%s' not found in DB store.", fName, title)
+					continue
+				}
 
-				// Fetch file content
-				content, err := fetchAttachment(ctx, dbPath, keyFile, pwd, title, fName)
+				content, err := binaryData.GetContentBytes()
 				if err != nil {
-					log.Printf("   [ERR] Failed to extract file: %v. Skipping...", err)
+					log.Printf("   [ERR] Failed to get content bytes for '%s': %v", fName, err)
 					continue
 				}
 
 				if len(content) == 0 {
-					log.Printf("   [WARN] File '%s' is empty.", fName)
+					log.Printf("   [WARN] File '%s' in entry '%s' is empty.", fName, title)
 				}
+
+				log.Printf("[EXTRACT] Extracting '%s' from entry '%s' -> '%s' (%d bytes)", fName, title, groupName, len(content))
 
 				currentDir.Files[safeFName] = &SecuredFile{
 					Name:        safeFName,
 					Content:     content,
 					AllowedBins: allowedBins,
 				}
-				log.Printf("   [OK] File loaded into memory (%d bytes).", len(content))
 			}
 		}
 
@@ -217,33 +179,12 @@ func loadDB(ctx context.Context, dbPath, keyFile string, pwd []byte) (*DirEntry,
 		}
 	}
 
-	// Start processing from the root group defined in XML
-	processGroup(db.Root.Group, rootEntry)
+	// Iterate over root groups
+	for _, g := range db.Content.Root.Groups {
+		processGroup(g, rootEntry)
+	}
+
 	return rootEntry, nil
-}
-
-// fetchAttachment calls CLI for a specific attachment accepts pwd as []byte
-func fetchAttachment(ctx context.Context, dbPath, keyFile string, pwd []byte, entryTitle, attachmentName string) ([]byte, error) {
-	args := []string{"attachment-export", "-q", dbPath, entryTitle, attachmentName, "/dev/stdout"}
-	if keyFile != "" {
-		args = append(args, "--key-file", keyFile)
-	}
-
-	cmd := exec.CommandContext(ctx, "keepassxc-cli", args...)
-
-	// SECURE FIX: Same usage of MultiReader to stream password
-	cmd.Stdin = io.MultiReader(bytes.NewReader(pwd), bytes.NewReader([]byte("\n")))
-
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("cmd error: %v, stderr: %s", err, stderr.String())
-	}
-
-	return out.Bytes(), nil
 }
 
 func parseRules(notes string) map[string]map[string]struct{} {
@@ -261,22 +202,27 @@ func parseRules(notes string) map[string]map[string]struct{} {
 		}
 
 		fName := strings.TrimSpace(parts[0])
-		bPath := strings.TrimSpace(parts[1])
+		rawPath := strings.TrimSpace(parts[1])
 
-		cleanPath := filepath.Clean(strings.TrimSpace(bPath))
-		fName = strings.TrimSpace(fName)
+		// Fix: Always convert to Absolute path
+		absPath, err := filepath.Abs(rawPath)
+		if err != nil {
+			log.Printf("[WARN] Could not determine absolute path for '%s': %v", rawPath, err)
+			continue
+		}
+
+		absPath = filepath.Clean(absPath)
 
 		if _, ok := res[fName]; !ok {
 			res[fName] = make(map[string]struct{})
 		}
 
-		// 1. Add literal path (e.g., /run/current-system/sw/bin/cat)
-		res[fName][cleanPath] = struct{}{}
+		// 1. Add literal absolute path
+		res[fName][absPath] = struct{}{}
 
-		// 2. IMPORTANT FOR NIXOS: Resolve symlinks
-		// Often /bin/foo is a symlink to /nix/store/.../bin/foo. We need to allow both.
-		resolved, err := filepath.EvalSymlinks(cleanPath)
-		if err == nil && resolved != cleanPath {
+		// 2. Resolve symlinks
+		resolved, err := filepath.EvalSymlinks(absPath)
+		if err == nil && resolved != absPath {
 			res[fName][resolved] = struct{}{}
 		}
 	}
@@ -296,16 +242,13 @@ var _ fs.NodeOnAdder = (*SecureDirNode)(nil)
 func (n *SecureDirNode) OnAdd(ctx context.Context) {
 	// Add subdirectories
 	for name, dirEntry := range n.Entry.Dirs {
-		// Traverse recursively by creating new Directory Inodes
 		childNode := &SecureDirNode{Entry: dirEntry}
-		// S_IFDIR for directories
 		childInode := n.NewPersistentInode(ctx, childNode, fs.StableAttr{Mode: fuse.S_IFDIR})
 		n.AddChild(name, childInode, true)
 	}
 
 	// Add files in this directory
 	for name, fileData := range n.Entry.Files {
-		// S_IFREG for regular files
 		childNode := &SecureFileNode{Data: fileData}
 		childInode := n.NewPersistentInode(ctx, childNode, fs.StableAttr{Mode: fuse.S_IFREG})
 		n.AddChild(name, childInode, true)
@@ -388,19 +331,19 @@ func main() {
 	mountPoint := args[1]
 
 	// Lock memory to prevent swapping secrets to disk
-	unix.Mlockall(unix.MCL_CURRENT | unix.MCL_FUTURE)
-
-	// Context for graceful shutdown during loading
-	ctx, cancel := context.WithCancel(context.Background())
+	if err := unix.Mlockall(unix.MCL_CURRENT | unix.MCL_FUTURE); err != nil {
+		log.Printf("[WARN] Failed to lock memory (mlockall): %v. Secrets might swap to disk.", err)
+	}
 
 	// Handle signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
+	userCancelCh := make(chan struct{})
 	go func() {
 		<-sigCh
 		log.Println("Interrupt received, shutting down...")
-		cancel()
+		close(userCancelCh)
 	}()
 
 	fmt.Print("KeePass Password: ")
@@ -410,19 +353,22 @@ func main() {
 		log.Fatal(err)
 	}
 
-	rootEntry, err := loadDB(ctx, dbPath, *keyFilePtr, bPwd)
+	// Check if cancelled before heavy lifting
+	select {
+	case <-userCancelCh:
+		wipeBytes(bPwd)
+		os.Exit(0)
+	default:
+	}
 
-	// Best-effort wiping of password from memory
+	rootEntry, err := loadDB(dbPath, *keyFilePtr, bPwd)
+
+	// Best-effort wiping of password from memory slice
 	wipeBytes(bPwd)
 	runtime.GC()
 
 	if err != nil {
-		// If cancelled by Context
-		if ctx.Err() == context.Canceled {
-			log.Println("Operation aborted by user.")
-			os.Exit(0)
-		}
-		log.Fatalf("Fatal error: %v", err)
+		log.Fatalf("Fatal error loading DB: %v", err)
 	}
 
 	// Basic check: verify if any files were loaded recursively
@@ -459,12 +405,13 @@ func main() {
 		},
 	}
 
-	// Mount the root entry found in the DB.
-	// We use the rootEntry.Dirs because usually the XML export has a single <Root> group
-	// which contains the actual user groups (e.g. "General", "Internet").
-	// We want the mount to show "General", "Internet", etc.
-	// Since loadDB wraps everything in a virtual "root", passing that virtual root
-	// as the mount source works perfectly.
+	// Check cancellation again before mount
+	select {
+	case <-userCancelCh:
+		os.Exit(0)
+	default:
+	}
+
 	server, err := fs.Mount(mountPoint, &SecureDirNode{Entry: rootEntry}, opts)
 	if err != nil {
 		log.Fatal(err)
@@ -472,8 +419,7 @@ func main() {
 
 	log.Printf("Mounted at %s. Press Ctrl+C to unmount.", mountPoint)
 
-	// Reset signal handler for unmount
-	signal.Stop(sigCh)
+	// Listen for unmount signal
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
