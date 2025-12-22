@@ -22,7 +22,8 @@ If the program is not in the list, the error EACCES (Permission Denied) is retur
 ## Install
 
 ```
-curl -L -O https://github.com/Split174/secure-keepass-fuse/releases/download/v1.0.0/myapp-linux-amd64
+curl -L -O https://github.com/Split174/secure-keepass-fuse/releases/download/v0.0.1/secure-keepass-fuse-amd64
+chmod +x secure-keepass-fuse-amd64
 ```
 
 ## Usage
