@@ -7,6 +7,10 @@ secure-keepass-fuse - **mounts attachments as fuse-filesystem**. These attachmen
 Warnings:
 - Allow access only to compiled binaries (Go, Rust, C++), not interpreters, unless you are willing to accept the risk of access by any script.
 
+## Demo
+
+[![asciicast](https://asciinema.org/a/3PIsHI4gVYdDyZMRqPGBLdZay.svg)](https://asciinema.org/a/3PIsHI4gVYdDyZMRqPGBLdZay)
+
 ## How it work
 
 1. The utility scans database records. If the entry has an attachment, it **checks the Notes field** for access rules in the format filename: /path/to/binary.
