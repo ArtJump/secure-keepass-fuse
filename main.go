@@ -343,6 +343,7 @@ func main() {
 	go func() {
 		<-sigCh
 		log.Println("Interrupt received, shutting down...")
+		os.Stdin.Close()
 		close(userCancelCh)
 	}()
 
