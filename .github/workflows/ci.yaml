@@ -19,3 +19,21 @@ jobs:
         
     - name: Test
       run: go test -v ./...
+  aurs:
+    - name: secure-keepass-fuse-bin
+      homepage: "https://github.com/Split174/secure-keepass-fuse"
+      description: "Mounts attachments as fuse-filesystem (Binary)"
+      maintainers:
+        - "Split174 <no-reply@aur.archlinux.org>"
+      license: "MIT"
+      git_url: "ssh://aur@aur.archlinux.org/secure-keepass-fuse-bin.git"
+      private_key: '{{ .Env.AUR_KEY }}'
+      commit_author:
+        name: "goreleaserbot"
+        email: "bot@goreleaser.com"
+      depends:
+        - "fuse3"
+      provides:
+        - "secure-keepass-fuse"
+      conflicts:
+        - "secure-keepass-fuse"
