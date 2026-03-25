@@ -33,6 +33,7 @@ jobs:
         email: "bot@goreleaser.com"
       depends:
         - "fuse3"
+        - "zenity"
       provides:
         - "secure-keepass-fuse"
       conflicts:
